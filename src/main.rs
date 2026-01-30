@@ -7,8 +7,7 @@ use tracing::{info, error};
 use tracing_subscriber;
 use uuid::Uuid;
 use services::secret;
-use std::sync::Mutex;
-use lazy_static::lazy_static;
+use sqlx::mysql::MySqlPool;
 
 #[derive(Deserialize)]
 struct SensorData {
@@ -40,7 +39,6 @@ struct Thresholds {
     aq: u32,
 }
 
-// Default thresholds
 const TEMP_THRESHOLD: f32 = 27.0;
 const HUM_THRESHOLD: f32 = 50.0;
 const AQ_THRESHOLD: u32 = 100;
@@ -63,26 +61,12 @@ fn get_role_from_header(req: &HttpRequest) -> Option<Role> {
         })
 }
 
-// Shared data for dashboard
-struct SharedData {
-    temperature: f32,
-    humidity: f32,
-    air_quality: u32,
-}
-
-lazy_static! {
-    static ref CURRENT_DATA: Mutex<SharedData> = Mutex::new(SharedData {
-        temperature: 0.0,
-        humidity: 0.0,
-        air_quality: 0,
-    });
-}
-
 #[post("/report")]
 async fn report(
     data: web::Json<SensorData>,
     req: HttpRequest,
     thresholds: web::Data<Thresholds>,
+    db_pool: web::Data<MySqlPool>,
 ) -> impl Responder {
     let correlation_id = Uuid::new_v4();
 
@@ -96,12 +80,17 @@ async fn report(
         return HttpResponse::BadRequest().body(e);
     }
 
-    // Save latest sensor data
+    if let Err(e) = sqlx::query!(
+        "INSERT INTO sensor_data (temperature, humidity, air_quality) VALUES (?, ?, ?)",
+        data.temperature,
+        data.humidity,
+        data.air_quality
+    )
+    .execute(db_pool.get_ref())
+    .await
     {
-        let mut current = CURRENT_DATA.lock().unwrap();
-        current.temperature = data.temperature;
-        current.humidity = data.humidity;
-        current.air_quality = data.air_quality;
+        error!(?correlation_id, "DB insert failed: {}", e);
+        return HttpResponse::InternalServerError().body("DB error");
     }
 
     info!(
@@ -109,7 +98,7 @@ async fn report(
         temp = data.temperature,
         hum = data.humidity,
         aq = data.air_quality,
-        "Received sensor data"
+        "Receiving sensor data"
     );
 
     let fan_on = data.temperature > thresholds.temp
@@ -132,24 +121,37 @@ async fn status(req: HttpRequest) -> impl Responder {
 }
 
 #[get("/current")]
-async fn current_data() -> impl Responder {
-    let current = CURRENT_DATA.lock().unwrap();
-    HttpResponse::Ok().json(&*current)
+async fn current(db_pool: web::Data<MySqlPool>) -> impl Responder {
+    let rec = sqlx::query!(
+        "SELECT temperature, humidity, air_quality FROM sensor_data ORDER BY id DESC LIMIT 1"
+    )
+    .fetch_one(db_pool.get_ref())
+    .await;
+
+    match rec {
+        Ok(r) => HttpResponse::Ok().json(r),
+        Err(_) => HttpResponse::Ok().json(serde_json::json!({"temperature":0.0,"humidity":0.0,"air_quality":0})),
+    }
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
-        .json()
         .with_env_filter("info")
+        .json()
         .init();
 
-    info!("Starting Arduino backend (HTTP)");
+    info!("Starting Arduino backend (HTTP + MySQL)");
 
+    // Loading API token
     match secret::get_secret("api/token").await {
         Ok(token) => info!(token = ?token, "API token loaded"),
         Err(e) => error!("Failed to load API token: {}", e),
     }
+
+    // MySQL
+    let db_url = "mysql://username:password@localhost/arduino_db";
+    let db_pool = MySqlPool::connect(db_url).await.unwrap();
 
     let thresholds = web::Data::new(Thresholds {
         temp: TEMP_THRESHOLD,
@@ -160,9 +162,10 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(thresholds.clone())
+            .app_data(web::Data::new(db_pool.clone()))
             .service(report)
             .service(status)
-            .service(current_data)
+            .service(current)
             .service(actix_files::Files::new("/", "./static").index_file("index.html"))
     })
     .bind("0.0.0.0:8080")?
