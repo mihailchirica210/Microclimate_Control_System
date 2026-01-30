@@ -1,11 +1,14 @@
 mod services;
 
 use actix_web::{post, get, web, App, HttpResponse, HttpServer, Responder, HttpRequest};
+use actix_files;
 use serde::{Deserialize, Serialize};
 use tracing::{info, error};
 use tracing_subscriber;
 use uuid::Uuid;
 use services::secret;
+use std::sync::Mutex;
+use lazy_static::lazy_static;
 
 #[derive(Deserialize)]
 struct SensorData {
@@ -16,11 +19,11 @@ struct SensorData {
 
 impl SensorData {
     fn validate(&self) -> Result<(), &'static str> {
-        if !( -50.0..=150.0 ).contains(&self.temperature) {
-            return Err("Temperature out of range");
+        if !(-50.0..=150.0).contains(&self.temperature) {
+            return Err("temperature out of range");
         }
         if !(0.0..=100.0).contains(&self.humidity) {
-            return Err("Humidity out of range");
+            return Err("humidity out of range");
         }
         Ok(())
     }
@@ -29,6 +32,12 @@ impl SensorData {
 #[derive(Serialize)]
 struct ControlCommand {
     fan_on: bool,
+}
+
+struct Thresholds {
+    temp: f32,
+    hum: f32,
+    aq: u32,
 }
 
 // Default thresholds
@@ -42,9 +51,8 @@ enum Role {
     Arduino,
 }
 
-fn main_role(req: &HttpRequest) -> Option<Role> {
-    req
-        .headers()
+fn get_role_from_header(req: &HttpRequest) -> Option<Role> {
+    req.headers()
         .get("X-Role")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_lowercase())
@@ -55,13 +63,30 @@ fn main_role(req: &HttpRequest) -> Option<Role> {
         })
 }
 
+// Shared data for dashboard
+struct SharedData {
+    temperature: f32,
+    humidity: f32,
+    air_quality: u32,
+}
+
+lazy_static! {
+    static ref CURRENT_DATA: Mutex<SharedData> = Mutex::new(SharedData {
+        temperature: 0.0,
+        humidity: 0.0,
+        air_quality: 0,
+    });
+}
+
 #[post("/report")]
 async fn report(
     data: web::Json<SensorData>,
     req: HttpRequest,
+    thresholds: web::Data<Thresholds>,
 ) -> impl Responder {
     let correlation_id = Uuid::new_v4();
-    if main_role(&req) != Some(Role::Arduino) {
+
+    if get_role_from_header(&req) != Some(Role::Arduino) {
         error!("CorrelationID {}: Unauthorized access", correlation_id);
         return HttpResponse::Forbidden().body("Unauthorized");
     }
@@ -71,12 +96,25 @@ async fn report(
         return HttpResponse::BadRequest().body(e);
     }
 
-    info!(?correlation_id, temp = data.temperature, hum = data.humidity, aq = data.air_quality, "Received sensor data");
+    // Save latest sensor data
+    {
+        let mut current = CURRENT_DATA.lock().unwrap();
+        current.temperature = data.temperature;
+        current.humidity = data.humidity;
+        current.air_quality = data.air_quality;
+    }
 
-    let fan_on =
-        data.temperature > TEMP_THRESHOLD ||
-        data.humidity > HUM_THRESHOLD ||
-        data.air_quality > AQ_THRESHOLD;
+    info!(
+        ?correlation_id,
+        temp = data.temperature,
+        hum = data.humidity,
+        aq = data.air_quality,
+        "Received sensor data"
+    );
+
+    let fan_on = data.temperature > thresholds.temp
+        || data.humidity > thresholds.hum
+        || data.air_quality > thresholds.aq;
 
     info!(?correlation_id, fan_on, "Fan turns on");
 
@@ -86,11 +124,17 @@ async fn report(
 #[get("/status")]
 async fn status(req: HttpRequest) -> impl Responder {
     let correlation_id = Uuid::new_v4();
-    if main_role(&req).is_none() {
+    if get_role_from_header(&req).is_none() {
         return HttpResponse::Forbidden().body("Unauthorized");
     }
     info!(?correlation_id, "Status checked");
     HttpResponse::Ok().body("Running with thresholds")
+}
+
+#[get("/current")]
+async fn current_data() -> impl Responder {
+    let current = CURRENT_DATA.lock().unwrap();
+    HttpResponse::Ok().json(&*current)
 }
 
 #[actix_web::main]
@@ -100,17 +144,26 @@ async fn main() -> std::io::Result<()> {
         .with_env_filter("info")
         .init();
 
-    info!("Starting Arduino backend (Http)");
+    info!("Starting Arduino backend (HTTP)");
 
     match secret::get_secret("api/token").await {
         Ok(token) => info!(token = ?token, "API token loaded"),
         Err(e) => error!("Failed to load API token: {}", e),
     }
 
+    let thresholds = web::Data::new(Thresholds {
+        temp: TEMP_THRESHOLD,
+        hum: HUM_THRESHOLD,
+        aq: AQ_THRESHOLD,
+    });
+
     HttpServer::new(move || {
         App::new()
+            .app_data(thresholds.clone())
             .service(report)
             .service(status)
+            .service(current_data)
+            .service(actix_files::Files::new("/", "./static").index_file("index.html"))
     })
     .bind("0.0.0.0:8080")?
     .run()
